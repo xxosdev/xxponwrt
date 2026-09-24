@@ -13,23 +13,25 @@ on:
           - an7583
       profile:
         description: >-
-          只编译某一台设备（会关掉多 profile 和逐设备 rootfs，明显更快）。
-          留空则用 configs/myapps.config 里选好的 4 台：
+          只编译某一台设备，比编 4 台快得多。留空则用 configs/myapps.config 里选好的 4 台：
           fiberhome_hg5382a / fiberhome_hg5585f-ct / fiberhome_hg5585f-cu / nokia_xg-040g-md-ubi
         required: false
         type: string
         default: ""
+      easytier:
+        description: 编入 EasyTier（异地组网 / 内网穿透），第三方包
+        required: false
+        default: true
+        type: boolean
       npu_status:
-        description: >-
-          编译 luci-app-airoha-npu：NPU 卸载引擎 / CPU 频率与超频 / PPE 流表状态页。
-          专为这块 SoC 写的，依赖只有 luci-base，可以放心开
+        description: 编入 luci-app-airoha-npu（SoC 状态页：NPU / CPU 频率温度 / PPE 流表），第三方包
         required: false
         default: true
         type: boolean
       aurora_theme:
         description: >-
-          编译 luci-theme-aurora 主题。官方 feeds 没有它，需要额外拉取，
-          且它用 Vite+Tailwind 构建、要在 runner 上跑 npm，是第三方包里最可能挂的一环
+          编入 luci-theme-aurora 主题，第三方包。用 Vite+Tailwind 构建、要在 runner 上跑 npm，
+          是整条流程里最容易挂的一环，失败会自动剔除、不影响主线
         required: false
         default: true
         type: boolean
@@ -44,7 +46,7 @@ on:
         default: false
         type: boolean
       release_tag:
-        description: Release 标签名
+        description: Release 标签名，留空则自动生成 日期-运行号
         required: false
         type: string
         default: ""
@@ -65,12 +67,12 @@ jobs:
   build:
     name: ${{ inputs.target }}${{ inputs.profile && format(' / {0}', inputs.profile) || ' / 全部设备' }}
     runs-on: ubuntu-24.04
-    # GHA 硬上限是 360 分钟，这里刻意留 10 分钟余量做收尾上传
+    # GHA 硬上限 360 分钟，留 10 分钟做收尾上传
     timeout-minutes: 350
 
-    # OpenWrt 的 rules.mk 里写着 CCACHE_DIR=$(TOPDIR)/.ccache，也就是 workspace/.ccache。
-    # 但命令行直接跑 `ccache -s` 会去读默认目录（~/.cache/ccache），两边不一致，
-    # 结果统计永远显示 0。在这里统一指定，让编译和查看统计都用同一个目录。
+    # rules.mk 里 CCACHE_DIR=$(TOPDIR)/.ccache，即 workspace/.ccache。
+    # 但命令行直接 `ccache -s` 会去读默认目录 ~/.cache/ccache，两边不一致，
+    # 统计就永远显示 0。在这里统一指定，编译和查看统计用同一个目录。
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
 
@@ -78,8 +80,8 @@ jobs:
       - name: 检出源码
         uses: actions/checkout@v6
 
-      # OpenWrt 全量编译需要 20GB 以上，GitHub 默认 runner 只有约 14GB 可用
-      # 这一步是必须的，不然大概率在编译内核时磁盘写满失败
+      # OpenWrt 全量编译要 20GB 以上，GitHub 默认 runner 只有约 14GB 可用。
+      # 不做这一步大概率在编内核时磁盘写满失败。
       - name: 腾出磁盘空间
         run: |
           df -h
@@ -107,19 +109,16 @@ jobs:
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
             uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
 
-      # ---------------------------------------------------------------
-      # 缓存层。这三份缓存是整个流程最大的提速点：
-      #   dl     源码压缩包，省去重复下载
-      #   ccache 编译结果缓存，改配置重编译时命中率极高
-      #   tc     交叉工具链，省掉每次最耗时的 toolchain 构建
-      # ---------------------------------------------------------------
-      # ⚠ 这三处特意用 cache/restore + cache/save 拆开写，而不是用 cache@v4 一把梭。
-      # 原因：cache@v4 是在 job 结束的 Post 阶段才保存。而 GitHub 有个规则——
+      # ======================================================================
+      # 缓存层：dl（源码包）+ ccache（编译结果）+ tc（交叉工具链）
+      #
+      # ★★ 这里刻意用 cache/restore + cache/save 拆开写，不用 cache@v4 一把梭 ★★
+      # cache@v4 在 job 结束的 Post 阶段才保存，而 GitHub 的规则是：
       #   job 结论为 failure 时，所有 Post 步骤全部跳过，缓存一个都不存。
-      # 上面两次失败都是这么丢的：工具链编好了、包下载好了，最后卡在一个
-      # 收尾步骤上，1 小时的工具链编译成果直接作废。
-      # 拆成 restore/save 后，每份缓存在"刚产出"的那一刻就立刻存档，
-      # 后面无论哪一步崩了都不会回头连累它。
+      # 之前两次失败都是这么丢的——工具链编好了、包下好了，最后卡在一个收尾步骤上，
+      # 一小时的工具链成果直接作废。拆成 restore/save 后，每份缓存在"刚产出"
+      # 那一刻就立刻存档，后面哪一步崩了都不会回头连累它。
+      # ======================================================================
       - name: 恢复源码包缓存
         id: dl-cache
         uses: actions/cache/restore@v4
@@ -149,27 +148,42 @@ jobs:
         if: steps.tc-cache.outputs.cache-hit == 'true'
         run: |
           tar --zstd -xf tc-cache.tar.zst
-          # 关键：解压出来的文件时间戳必须比刚检出的源码新
-          # 否则 make 会因为源码更新而把整个工具链重新编译一遍
+          # 关键：解压出来的文件时间戳必须比刚检出的源码新，
+          # 否则 make 会认为源码更新过，把整个工具链重编一遍。
           find staging_dir -exec touch {} + 2>/dev/null || true
 
-      # 不在官方 feeds 里的包必须在这里拉进 package/，且必须赶在 feeds install
-      # 之前完成，否则 defconfig 会因为找不到包而静默丢掉 myapps.config 里写的行。
+      # ======================================================================
+      # 第三方包。官方 feeds 里没有的包必须在这里拉进 package/，
+      # 且必须赶在 feeds install 之前完成 —— 否则 defconfig 找不到包，
+      # 会把 myapps.config 里对应的行静默丢掉。
       #
-      # 顺带说明：airoha-pond / airoha-ponctl 是 Rust 写的，会连带触发 rust/host
-      # 工具链全量编译，这是首次构建最慢的一段，比内核还狠。好在 toolchain 缓存
-      # 里包含了 staging_dir/host，第二次构建能直接跳过。
+      # 顺带一提：airoha-pond / airoha-ponctl 是 Rust 写的，会触发 rust/host
+      # 工具链全量编译，是首次构建最慢的一段，比内核还狠。好在 tc 缓存里
+      # 包含 staging_dir/host，第二次构建能直接跳过。
+      # ======================================================================
       - name: 拉取第三方包
         run: |
-          # ---- EasyTier（异地组网）----
-          # 这个仓库里是 easytier/ 和 luci-app-easytier/ 两个平级子目录。
-          # OpenWrt 只扫描 package/<单级目录>/Makefile，不会递归进子目录，
-          # 所以必须把两个子包分别摊平到 package/ 下，整目录 clone 是不启作用的。
-          if git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git /tmp/easytier-repo; then
-            # po/zh-cn 是个指向 zh_Hans 的符号链接。留着的话 luci.mk 会把同一个
-            # 翻译文件处理两次，生成两个同名的 i18n 包，某些版本下会直接编译报错。
-            # 注意只有在 Linux 系统上 clone 它才是真符号链接（Windows 上会退化成
-            # 一个内容为 "./zh_Hans" 的文本文件），runner 是 ubuntu，必须删。
+          # 拉不到（或开关关掉）的包要从增量配置里摘掉，
+          # 免得后面「校验自定义包」步骤飘一堆无意义的黄字。
+          drop_pkg() {
+            for p in "$@"; do
+              sed -i "/^CONFIG_PACKAGE_${p}=/d" configs/myapps.config
+            done
+            echo "  已从 myapps.config 摘除: $*"
+          }
+
+          # ---- EasyTier（异地组网 / 内网穿透）----
+          # 仓库里是 easytier/ 和 luci-app-easytier/ 两个平级子目录。
+          # OpenWrt 只扫描 package/<单级目录>/Makefile，不递归进子目录，
+          # 所以必须把两个子包分别摊平到 package/ 下，整目录 clone 是不起作用的。
+          if [ "${{ inputs.easytier }}" != "true" ]; then
+            echo "EasyTier：开关关闭"
+            drop_pkg easytier luci-app-easytier luci-i18n-easytier-zh-cn luci-compat
+          elif git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git /tmp/easytier-repo; then
+            # po/zh-cn 是指向 zh_Hans 的符号链接。留着的话 luci.mk 会把同一份译文
+            # 处理两次、生成两个同名 i18n 包，某些版本下直接编译报错。
+            # 只有在 Linux 上 clone 它才是真符号链接（Windows 会退化成内容为
+            # "./zh_Hans" 的 9 字节文本），runner 是 ubuntu，必须删。
             rm -f /tmp/easytier-repo/luci-app-easytier/po/zh-cn
 
             mv /tmp/easytier-repo/easytier           package/easytier
@@ -177,29 +191,61 @@ jobs:
             echo "EasyTier 就位"
           else
             echo "::warning::EasyTier 拉取失败，本次固件不含 EasyTier"
+            drop_pkg easytier luci-app-easytier luci-i18n-easytier-zh-cn luci-compat
           fi
 
-          # ---- Airoha NPU / SoC 状态页 ----
-          # 依赖只有 +luci-base @TARGET_airoha，专为这块 SoC 写的
-          if [ "${{ inputs.npu_status }}" = "true" ]; then
-            git clone --depth 1 https://github.com/rchen14b/luci-app-airoha-npu.git \
-              package/luci-app-airoha-npu || echo "::warning::NPU 状态页拉取失败，跳过"
+          # ---- Airoha SoC 状态页（NPU / CPU / Frame Engine）----
+          # 用 luanmuc 的改进分支而不是上游 rchen14b：自带完整简体中文（49 条），
+          # 且有独立 CPU 温度、超频失败自动回滚、PSE 映射修正等一批修复。
+          # 上游 po 只有西班牙语，且那份 es.po 照旧版界面写，早已跟代码对不上。
+          if [ "${{ inputs.npu_status }}" != "true" ]; then
+            echo "SoC 状态页：开关关闭"
+            drop_pkg luci-app-airoha-npu luci-i18n-airoha-npu-zh-cn
+          elif git clone --depth 1 https://github.com/luanmuc/luci-app-airoha-npu.git \
+                package/luci-app-airoha-npu; then
+            # 中文随包自带，luci.mk 会编译成 luci-i18n-airoha-npu-zh-cn。
+            # 校验放在 feeds install 之前，这时 po 目录还在源码树里。
+            po=package/luci-app-airoha-npu/po/zh_Hans/luci-app-airoha-npu.po
+            if [ -f "$po" ]; then
+              echo "SoC 状态页就位，自带简体中文 $(grep -c '^msgid' "$po") 条"
+            else
+              echo "::warning::该版本没带 zh_Hans 译文，页面会显示英文，请检查上游目录结构"
+            fi
           else
-            echo "跳过 NPU 状态页"
+            echo "::warning::SoC 状态页拉取失败，本次固件不含该页面"
+            drop_pkg luci-app-airoha-npu luci-i18n-airoha-npu-zh-cn
           fi
 
           # ---- aurora 主题 ----
-          # Vite + Tailwind 构建，要在 runner 上跑 npm，是第三方包里最容易挂的一环
-          if [ "${{ inputs.aurora_theme }}" = "true" ]; then
-            git clone --depth 1 https://github.com/eamonxg/luci-theme-aurora.git \
-              package/luci-theme-aurora || echo "::warning::主题拉取失败，跳过"
+          if [ "${{ inputs.aurora_theme }}" != "true" ]; then
+            echo "aurora 主题：开关关闭"
+            drop_pkg luci-theme-aurora
+          elif git clone --depth 1 https://github.com/eamonxg/luci-theme-aurora.git \
+                package/luci-theme-aurora; then
+            echo "aurora 主题就位"
           else
-            echo "跳过 aurora 主题"
+            echo "::warning::aurora 主题拉取失败，本次固件回退到默认主题"
+            drop_pkg luci-theme-aurora
           fi
 
           echo "=== package/ 下的第三方包 ==="
           ls -d package/easytier package/luci-app-easytier \
                 package/luci-app-airoha-npu package/luci-theme-aurora 2>/dev/null || true
+
+      # files/ 目录里的东西会被原样打进固件的对应路径。
+      # ⚠ 通过 GitHub 网页上传的文件一律没有可执行位，脚本类文件会被装成不可执行，
+      #   /sbin/cpuinfo 这类 rpcd 调用会直接失败。这里统一补权限。
+      - name: 修正内置脚本权限
+        run: |
+          [ -d files ] || { echo "无 files/ 目录，跳过"; exit 0; }
+          for f in $(find files -type f 2>/dev/null); do
+            case "$f" in
+              */sbin/*|*/etc/init.d/*|*/etc/uci-defaults/*|*/etc/rc.local) chmod +x "$f" ;;
+              *.sh)                                                        chmod +x "$f" ;;
+            esac
+          done
+          echo "=== files/ 内容 ==="
+          find files -type f -exec ls -l {} \; 2>/dev/null || true
 
       - name: 安装 feeds
         run: |
@@ -208,14 +254,15 @@ jobs:
 
       - name: 生成 .config
         run: |
-          # 兜底：通过网页 / Windows 编辑器提交的文件可能带 CRLF。
-          # kconfig.pl 是 Perl 脚本，chomp 不处理 \r，会让键名带上回车符，
+          # 兜底：网页 / Windows 编辑器提交的文件可能带 CRLF。
+          # kconfig.pl 是 Perl 脚本，chomp 不处理 \r，键名会带上回车符，
           # 结果是配置行解析不出来却不报错。这里统一清掉行尾回车。
           sed -i 's/\r$//' configs/*.config
 
-          # 默认走 configs/myapps.config 里选好的那 4 台。
-          # 填了 profile 就切成单设备模式：把那 4 条 =y 全删掉再写指定的一台。
-          # （不能只是改一行，那样会留下重复的设备条目）
+          # 填了 profile 就切单设备模式：先删掉 myapps.config 里全部设备行，
+          # 再只写指定的那一台（只改一行会留下重复的设备条目）。
+          # 提速来自「rootfs 从 4 份变 1 份」，CONFIG_TARGET_PER_DEVICE_ROOTFS
+          # 保持基线不动。
           if [ -n "${{ inputs.profile }}" ]; then
             echo "=== 单设备模式：${{ inputs.profile }} ==="
             sed -i -E '/^CONFIG_TARGET_DEVICE_airoha_[a-z0-9]+_DEVICE_[A-Za-z0-9_-]+=y$/d' \
@@ -226,7 +273,7 @@ jobs:
             echo "=== 多设备模式：编译 myapps.config 里选中的全部设备 ==="
           fi
 
-          # kconfig.pl 的叠加顺序是「先官方后自定义」，后者覆盖前者，
+          # 先官方后自定义，后者覆盖前者，
           # 所以 myapps.config 里的 "is not set" 能把官方的 =y 关掉。
           ./scripts/kconfig.pl + \
             "configs/${{ inputs.target }}.config" \
@@ -235,7 +282,13 @@ jobs:
           echo "CONFIG_CCACHE=y" >> .config
           make defconfig
 
-          # 打印最终要编译的设备，一眼确认有没有选错
+          # profile 名字写错的话，defconfig 会静默编出 0 台设备，
+          # 一路跑到最后的上传步骤才因找不到文件报错。这里提前拦下来。
+          if ! grep -qE '^CONFIG_TARGET_DEVICE_airoha_[a-z0-9]+_DEVICE_[A-Za-z0-9_-]+=y$' .config; then
+            echo "::error::.config 里没有任何被选中的设备，多半是 profile 名字写错了"
+            exit 1
+          fi
+
           echo "=== 本次编译的设备 ==="
           grep -oE '^CONFIG_TARGET_DEVICE_airoha_[a-z0-9]+_DEVICE_[A-Za-z0-9_-]+=y' .config \
             | sed 's/CONFIG_TARGET_DEVICE_airoha_/  /;s/_DEVICE_/  \//;s/=y//'
@@ -246,8 +299,7 @@ jobs:
       - name: 校验 PON 核心组件是否编入固件
         run: |
           # 必须全部是 =y（进固件）。=m 只在 bin/packages 里出 apk，刷完得手动装，
-          # 对 frontend 驱动来说等于没有，pon0 接口根本起不来。
-          # en7572 和 paged-bosa 两个都要：烽火那 3 台吃 paged-bosa，Nokia MD 吃 en7572。
+          # 对光模块驱动来说等于没有，pon0 接口根本起不来。
           fatal=""
           for pkg in \
             airoha-pond airoha-ponctl airoha-pon-debug luci-app-pon \
@@ -282,14 +334,14 @@ jobs:
             fi
           done
           if [ -n "$missing" ]; then
-            echo "::warning::以下包没被编入，通常 feeds 里没有或包名写错:$missing"
+            echo "::warning::以下包没被编入，通常是 feeds 里没有或包名写错:$missing"
           fi
 
       - name: 下载源码包
         run: make download -j"$(nproc)"
 
       # 刚下载完就立刻存档。以前靠 job 结束时的 Post 自动保存，
-      # 一旦后面某步失败就全丢了，等于下次还要重新下载几百 MB。
+      # 后面某步一失败就全丢了，下次还得重下几百 MB。
       - name: 保存源码包缓存
         if: steps.dl-cache.outputs.cache-hit != 'true'
         continue-on-error: true
@@ -298,9 +350,9 @@ jobs:
           path: dl
           key: ponwrt-dl-${{ inputs.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
 
+      # 单独先跑一遍工具链，这样能把 tc 缓存存下来，
+      # 后面 make world 即便失败，工具链也不白做。
       - name: 编译工具链
-        # 先单独跑一遍工具链，这样能把 toolchain 缓存保存下来
-        # 后续即便 make world 失败，工具链也不会白做
         run: make toolchain/install -j"$(nproc)"
 
       - name: 打包交叉工具链
@@ -337,17 +389,15 @@ jobs:
 
       - name: 保存交叉工具链缓存
         if: steps.pack-tc.outputs.packed == 'true'
-        # 工具链是最耗时的一段，刚编好就立刻存档，不等 job 收尾
         continue-on-error: true
         uses: actions/cache/save@v4
         with:
           path: tc-cache.tar.zst
           key: ponwrt-tc-${{ inputs.target }}-${{ hashFiles('target/linux/airoha/**', 'toolchain/**', 'include/**') }}
 
-      # aurora 用 Vite+Tailwind 构建，要在 runner 上跑 npm，是整条流程里
-      # 最容易失败的一环（npm registry 抽风、内存不够都可能挂）。
-      # 这里先单独编它：成功就继续；失败则自动从本次构建里摘掉，
-      # 保证主线固件不会因为一个皮肤整锅端。
+      # aurora 用 Vite+Tailwind 构建，要跑 npm，是整条流程里最容易失败的一环
+      # （npm registry 抽风、内存不够都可能挂）。这里先单独编它：
+      # 成功就继续；失败则自动从本次构建里摘掉，保证主线固件不被一个皮肤拖垮。
       - name: 预编译 aurora 主题（失败自动降级）
         if: inputs.aurora_theme
         run: |
@@ -360,7 +410,6 @@ jobs:
             echo "::warning::aurora 主题编译失败，自动从本次构建中移除"
             sed -i '/CONFIG_PACKAGE_luci-theme-aurora/d' configs/myapps.config .config
             make defconfig
-            echo "降级后确认 aurora 已剔除:"
             grep 'luci-theme-aurora' .config || echo "  已剔除，固件其余功能不受影响"
           fi
 
@@ -391,10 +440,8 @@ jobs:
       - name: 整理产物
         run: |
           mkdir -p out out/packages
-          # 固件本体：sysupgrade.itb 和 recovery.itb
           find bin/targets/airoha/${{ inputs.target }} -name '*.itb' \
             -exec cp {} out/ \; 2>/dev/null || true
-          # =m 的那些包会编成 apk 安装包，刷完机可以 apk add 按需装
           find bin/packages -name '*.apk' \
             -exec cp {} out/packages/ \; 2>/dev/null || true
           cd out && sha256sum *.itb > sha256sums 2>/dev/null || true
@@ -411,8 +458,8 @@ jobs:
 
       - name: 发布 Release
         if: inputs.create_release
-        # 发布是收尾步骤，绝不能让整个 job 变红：job 一旦判 failure
-        # 就会顺带丢掉本次所有缓存。
+        # 发布是收尾步骤，绝不能让整个 job 变红：job 一旦判 failure，
+        # 本次所有缓存都会被跳过保存。
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
@@ -423,8 +470,7 @@ jobs:
           fi
 
           # ⚠ GitHub Release 只接受"文件"。写成 out/* 会把 out/packages
-          # 这个目录也一起带上，gh 就报：
-          #   read out/packages: is a directory
+          # 这个目录也一起带上，gh 就报：read out/packages: is a directory
           # 这里显式筛出普通文件，再把 apk 目录单独压成一个 tar.gz。
           assets=()
           for f in out/*; do
