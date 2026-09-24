@@ -68,6 +68,12 @@ jobs:
     # GHA 硬上限是 360 分钟，这里刻意留 10 分钟余量做收尾上传
     timeout-minutes: 350
 
+    # OpenWrt 的 rules.mk 里写着 CCACHE_DIR=$(TOPDIR)/.ccache，也就是 workspace/.ccache。
+    # 但命令行直接跑 `ccache -s` 会去读默认目录（~/.cache/ccache），两边不一致，
+    # 结果统计永远显示 0。在这里统一指定，让编译和查看统计都用同一个目录。
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+
     steps:
       - name: 检出源码
         uses: actions/checkout@v6
@@ -193,6 +199,11 @@ jobs:
 
       - name: 生成 .config
         run: |
+          # 兜底：通过网页 / Windows 编辑器提交的文件可能带 CRLF。
+          # kconfig.pl 是 Perl 脚本，chomp 不处理 \r，会让键名带上回车符，
+          # 结果是配置行解析不出来却不报错。这里统一清掉行尾回车。
+          sed -i 's/\r$//' configs/*.config
+
           # 默认走 configs/myapps.config 里选好的那 4 台。
           # 填了 profile 就切成单设备模式：把那 4 条 =y 全删掉再写指定的一台。
           # （不能只是改一行，那样会留下重复的设备条目）
@@ -275,9 +286,56 @@ jobs:
 
       - name: 保存交叉工具链缓存
         if: steps.tc-cache.outputs.cache-hit != 'true'
+        # 这一步绝不能反过来把整个 job 拖挂：工具链已经编了 1 小时，
+        # 只是"没打包成功"的话，代价应该是丢下一次构建的速度优势，而不是白编一遍。
+        continue-on-error: true
         run: |
-          tar --zstd -cf tc-cache.tar.zst staging_dir/toolchain staging_dir/host
+          # ⚠ 工具链目录名不是固定的 "toolchain"！
+          # rules.mk: TOOLCHAIN_DIR_NAME = toolchain-$(ARCH)$(ARCH_SUFFIX)_gcc-$(GCCV)$(DIR_SUFFIX)
+          # 实际是 staging_dir/toolchain-aarch64_cortex-a53_gcc-<版本>_musl 这种，
+          # 写死成 staging_dir/toolchain 会直接 tar 失败。这里用通配符动态发现。
+          echo "=== staging_dir 实际内容 ==="
+          ls -la staging_dir/ 2>/dev/null || true
+
+          targets="staging_dir/host"
+          found=0
+          for d in staging_dir/toolchain-*; do
+            [ -d "$d" ] || continue
+            targets="$targets $d"
+            found=1
+            echo "  发现工具链目录: $d"
+          done
+
+          if [ "$found" -eq 0 ]; then
+            echo "::warning::没找到 staging_dir/toolchain-*，跳过缓存打包（不影响本次编译）"
+            exit 0
+          fi
+
+          if ! tar --zstd -cf tc-cache.tar.zst $targets; then
+            echo "::warning::工具链打包失败，跳过缓存保存（不影响本次编译）"
+            exit 0
+          fi
           ls -lh tc-cache.tar.zst
+
+      # aurora 用 Vite+Tailwind 构建，要在 runner 上跑 npm，是整条流程里
+      # 最容易失败的一环（npm registry 抽风、内存不够都可能挂）。
+      # 这里先单独编它：成功就继续；失败则自动从本次构建里摘掉，
+      # 保证主线固件不会因为一个皮肤整锅端。
+      - name: 预编译 aurora 主题（失败自动降级）
+        if: inputs.aurora_theme
+        run: |
+          V=""
+          [ "${{ inputs.verbose }}" = "true" ] && V="V=s"
+
+          if make $V package/luci-theme-aurora/compile; then
+            echo "aurora 主题编译成功，将随固件一起打包"
+          else
+            echo "::warning::aurora 主题编译失败，自动从本次构建中移除"
+            sed -i '/CONFIG_PACKAGE_luci-theme-aurora/d' configs/myapps.config .config
+            make defconfig
+            echo "降级后确认 aurora 已剔除:"
+            grep 'luci-theme-aurora' .config || echo "  已剔除，固件其余功能不受影响"
+          fi
 
       - name: 编译固件
         run: |
@@ -289,7 +347,10 @@ jobs:
 
       - name: 查看 ccache 统计
         if: always()
-        run: ccache -s || true
+        run: |
+          echo "CCACHE_DIR = ${CCACHE_DIR:-<未设置>}"
+          du -sh "$CCACHE_DIR" 2>/dev/null || echo "  ccache 目录还不存在"
+          ccache -s || true
 
       - name: 整理产物
         run: |
