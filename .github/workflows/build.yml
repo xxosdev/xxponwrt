@@ -113,8 +113,16 @@ jobs:
       #   ccache 编译结果缓存，改配置重编译时命中率极高
       #   tc     交叉工具链，省掉每次最耗时的 toolchain 构建
       # ---------------------------------------------------------------
+      # ⚠ 这三处特意用 cache/restore + cache/save 拆开写，而不是用 cache@v4 一把梭。
+      # 原因：cache@v4 是在 job 结束的 Post 阶段才保存。而 GitHub 有个规则——
+      #   job 结论为 failure 时，所有 Post 步骤全部跳过，缓存一个都不存。
+      # 上面两次失败都是这么丢的：工具链编好了、包下载好了，最后卡在一个
+      # 收尾步骤上，1 小时的工具链编译成果直接作废。
+      # 拆成 restore/save 后，每份缓存在"刚产出"的那一刻就立刻存档，
+      # 后面无论哪一步崩了都不会回头连累它。
       - name: 恢复源码包缓存
-        uses: actions/cache@v4
+        id: dl-cache
+        uses: actions/cache/restore@v4
         with:
           path: dl
           key: ponwrt-dl-${{ inputs.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
@@ -122,7 +130,8 @@ jobs:
             ponwrt-dl-${{ inputs.target }}-
 
       - name: 恢复 ccache 缓存
-        uses: actions/cache@v4
+        id: cc-cache
+        uses: actions/cache/restore@v4
         with:
           path: .ccache
           key: ponwrt-ccache-${{ inputs.target }}-${{ github.sha }}
@@ -131,7 +140,7 @@ jobs:
 
       - name: 恢复交叉工具链缓存
         id: tc-cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: tc-cache.tar.zst
           key: ponwrt-tc-${{ inputs.target }}-${{ hashFiles('target/linux/airoha/**', 'toolchain/**', 'include/**') }}
@@ -279,16 +288,24 @@ jobs:
       - name: 下载源码包
         run: make download -j"$(nproc)"
 
+      # 刚下载完就立刻存档。以前靠 job 结束时的 Post 自动保存，
+      # 一旦后面某步失败就全丢了，等于下次还要重新下载几百 MB。
+      - name: 保存源码包缓存
+        if: steps.dl-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ inputs.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+
       - name: 编译工具链
         # 先单独跑一遍工具链，这样能把 toolchain 缓存保存下来
         # 后续即便 make world 失败，工具链也不会白做
         run: make toolchain/install -j"$(nproc)"
 
-      - name: 保存交叉工具链缓存
+      - name: 打包交叉工具链
+        id: pack-tc
         if: steps.tc-cache.outputs.cache-hit != 'true'
-        # 这一步绝不能反过来把整个 job 拖挂：工具链已经编了 1 小时，
-        # 只是"没打包成功"的话，代价应该是丢下一次构建的速度优势，而不是白编一遍。
-        continue-on-error: true
         run: |
           # ⚠ 工具链目录名不是固定的 "toolchain"！
           # rules.mk: TOOLCHAIN_DIR_NAME = toolchain-$(ARCH)$(ARCH_SUFFIX)_gcc-$(GCCV)$(DIR_SUFFIX)
@@ -316,6 +333,16 @@ jobs:
             exit 0
           fi
           ls -lh tc-cache.tar.zst
+          echo "packed=true" >> "$GITHUB_OUTPUT"
+
+      - name: 保存交叉工具链缓存
+        if: steps.pack-tc.outputs.packed == 'true'
+        # 工具链是最耗时的一段，刚编好就立刻存档，不等 job 收尾
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: tc-cache.tar.zst
+          key: ponwrt-tc-${{ inputs.target }}-${{ hashFiles('target/linux/airoha/**', 'toolchain/**', 'include/**') }}
 
       # aurora 用 Vite+Tailwind 构建，要在 runner 上跑 npm，是整条流程里
       # 最容易失败的一环（npm registry 抽风、内存不够都可能挂）。
@@ -352,6 +379,15 @@ jobs:
           du -sh "$CCACHE_DIR" 2>/dev/null || echo "  ccache 目录还不存在"
           ccache -s || true
 
+      # ccache 的价值是跨次累积，哪怕本次编译挂了也要存下来
+      - name: 保存 ccache 缓存
+        if: always() && steps.cc-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v4
+        with:
+          path: .ccache
+          key: ponwrt-ccache-${{ inputs.target }}-${{ github.sha }}
+
       - name: 整理产物
         run: |
           mkdir -p out out/packages
@@ -375,13 +411,47 @@ jobs:
 
       - name: 发布 Release
         if: inputs.create_release
+        # 发布是收尾步骤，绝不能让整个 job 变红：job 一旦判 failure
+        # 就会顺带丢掉本次所有缓存。
+        continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ inputs.release_tag }}"
-          [ -z "$TAG" ] && TAG="$(date +%Y%m%d)-${{ github.run_number }}"
-          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+          if [ -z "$TAG" ]; then
+            TAG="$(date +%Y%m%d)-${{ github.run_number }}"
+          fi
+
+          # ⚠ GitHub Release 只接受"文件"。写成 out/* 会把 out/packages
+          # 这个目录也一起带上，gh 就报：
+          #   read out/packages: is a directory
+          # 这里显式筛出普通文件，再把 apk 目录单独压成一个 tar.gz。
+          assets=()
+          for f in out/*; do
+            [ -f "$f" ] && assets+=("$f")
+          done
+          if [ -d out/packages ] && [ -n "$(ls -A out/packages 2>/dev/null)" ]; then
+            tar -czf out/packages.tar.gz -C out packages
+            assets+=("out/packages.tar.gz")
+            echo "已把 $(ls out/packages | wc -l) 个 apk 打包为 packages.tar.gz"
+          fi
+
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::warning::out/ 下没有可发布的文件，跳过发布"
+            exit 0
+          fi
+          echo "=== 待发布 ${#assets[@]} 个文件 ==="
+          printf '  %s\n' "${assets[@]}"
+
+          # 同名 Release 已存在时 create 会直接失败，先把旧的删掉
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG 已存在，先删除旧版再重建"
+            gh release delete "$TAG" --repo "$GITHUB_REPOSITORY" -y
+          fi
+
+          gh release create "$TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" \
             --target "$GITHUB_SHA" --title "PonWrt $TAG" --generate-notes
+          echo "Release $TAG 发布完成"
 
       - name: 失败排查提示
         if: failure()
