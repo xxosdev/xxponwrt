@@ -1,0 +1,329 @@
+name: 构建 PonWrt 固件
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: SoC 目标平台
+        required: true
+        default: an7581
+        type: choice
+        options:
+          - an7581
+          - an7583
+      profile:
+        description: >-
+          只编译某一台设备（会关掉多 profile 和逐设备 rootfs，明显更快）。
+          留空则用 configs/myapps.config 里选好的 4 台：
+          fiberhome_hg5382a / fiberhome_hg5585f-ct / fiberhome_hg5585f-cu / nokia_xg-040g-md-ubi
+        required: false
+        type: string
+        default: ""
+      npu_status:
+        description: >-
+          编译 luci-app-airoha-npu：NPU 卸载引擎 / CPU 频率与超频 / PPE 流表状态页。
+          专为这块 SoC 写的，依赖只有 luci-base，可以放心开
+        required: false
+        default: true
+        type: boolean
+      aurora_theme:
+        description: >-
+          编译 luci-theme-aurora 主题。官方 feeds 没有它，需要额外拉取，
+          且它用 Vite+Tailwind 构建、要在 runner 上跑 npm，是第三方包里最可能挂的一环
+        required: false
+        default: true
+        type: boolean
+      verbose:
+        description: 输出完整编译日志(V=s)，排错用，会慢一些
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: 编译完成后创建 GitHub Release
+        required: false
+        default: false
+        type: boolean
+      release_tag:
+        description: Release 标签名
+        required: false
+        type: string
+        default: ""
+
+  # 想改成推送即触发，取消下面注释即可
+  # push:
+  #   branches: [ main ]
+  #   paths-ignore: [ '**.md' ]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ inputs.target || 'an7581' }}-${{ inputs.profile || 'all' }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: ${{ inputs.target }}${{ inputs.profile && format(' / {0}', inputs.profile) || ' / 全部设备' }}
+    runs-on: ubuntu-24.04
+    # GHA 硬上限是 360 分钟，这里刻意留 10 分钟余量做收尾上传
+    timeout-minutes: 350
+
+    steps:
+      - name: 检出源码
+        uses: actions/checkout@v6
+
+      # OpenWrt 全量编译需要 20GB 以上，GitHub 默认 runner 只有约 14GB 可用
+      # 这一步是必须的，不然大概率在编译内核时磁盘写满失败
+      - name: 腾出磁盘空间
+        run: |
+          df -h
+          sudo rm -rf \
+            /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/powershell /usr/share/swift \
+            /usr/lib/jvm /opt/az /usr/local/lib/julia \
+            /opt/google /usr/local/.ghcup /opt/microsoft
+          sudo docker image prune --all --force || true
+          df -h
+
+      - name: 安装编译依赖
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            asciidoc autoconf automake autopoint binutils bison build-essential \
+            bzip2 ccache clang cmake cpio curl device-tree-compiler flex gawk \
+            gettext git g++-multilib gcc-multilib gperf help2man intltool \
+            libelf-dev libglib2.0-dev libgmp3-dev libltdl-dev libmpc-dev \
+            libmpfr-dev libncurses-dev libpython3-dev libreadline-dev libssl-dev \
+            libtool libyaml-dev lld llvm ninja-build p7zip-full patch pkgconf \
+            python3 python3-docutils python3-pip python3-ply python3-pyelftools \
+            qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
+            uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
+
+      # ---------------------------------------------------------------
+      # 缓存层。这三份缓存是整个流程最大的提速点：
+      #   dl     源码压缩包，省去重复下载
+      #   ccache 编译结果缓存，改配置重编译时命中率极高
+      #   tc     交叉工具链，省掉每次最耗时的 toolchain 构建
+      # ---------------------------------------------------------------
+      - name: 恢复源码包缓存
+        uses: actions/cache@v4
+        with:
+          path: dl
+          key: ponwrt-dl-${{ inputs.target }}-${{ hashFiles('feeds.conf.default', 'configs/*.config') }}
+          restore-keys: |
+            ponwrt-dl-${{ inputs.target }}-
+
+      - name: 恢复 ccache 缓存
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ponwrt-ccache-${{ inputs.target }}-${{ github.sha }}
+          restore-keys: |
+            ponwrt-ccache-${{ inputs.target }}-
+
+      - name: 恢复交叉工具链缓存
+        id: tc-cache
+        uses: actions/cache@v4
+        with:
+          path: tc-cache.tar.zst
+          key: ponwrt-tc-${{ inputs.target }}-${{ hashFiles('target/linux/airoha/**', 'toolchain/**', 'include/**') }}
+
+      - name: 还原交叉工具链
+        if: steps.tc-cache.outputs.cache-hit == 'true'
+        run: |
+          tar --zstd -xf tc-cache.tar.zst
+          # 关键：解压出来的文件时间戳必须比刚检出的源码新
+          # 否则 make 会因为源码更新而把整个工具链重新编译一遍
+          find staging_dir -exec touch {} + 2>/dev/null || true
+
+      # 不在官方 feeds 里的包必须在这里拉进 package/，且必须赶在 feeds install
+      # 之前完成，否则 defconfig 会因为找不到包而静默丢掉 myapps.config 里写的行。
+      #
+      # 顺带说明：airoha-pond / airoha-ponctl 是 Rust 写的，会连带触发 rust/host
+      # 工具链全量编译，这是首次构建最慢的一段，比内核还狠。好在 toolchain 缓存
+      # 里包含了 staging_dir/host，第二次构建能直接跳过。
+      - name: 拉取第三方包
+        run: |
+          # ---- EasyTier（异地组网）----
+          # 这个仓库里是 easytier/ 和 luci-app-easytier/ 两个平级子目录。
+          # OpenWrt 只扫描 package/<单级目录>/Makefile，不会递归进子目录，
+          # 所以必须把两个子包分别摊平到 package/ 下，整目录 clone 是不启作用的。
+          if git clone --depth 1 https://github.com/EasyTier/luci-app-easytier.git /tmp/easytier-repo; then
+            # po/zh-cn 是个指向 zh_Hans 的符号链接。留着的话 luci.mk 会把同一个
+            # 翻译文件处理两次，生成两个同名的 i18n 包，某些版本下会直接编译报错。
+            # 注意只有在 Linux 系统上 clone 它才是真符号链接（Windows 上会退化成
+            # 一个内容为 "./zh_Hans" 的文本文件），runner 是 ubuntu，必须删。
+            rm -f /tmp/easytier-repo/luci-app-easytier/po/zh-cn
+
+            mv /tmp/easytier-repo/easytier           package/easytier
+            mv /tmp/easytier-repo/luci-app-easytier  package/luci-app-easytier
+            echo "EasyTier 就位"
+          else
+            echo "::warning::EasyTier 拉取失败，本次固件不含 EasyTier"
+          fi
+
+          # ---- Airoha NPU / SoC 状态页 ----
+          # 依赖只有 +luci-base @TARGET_airoha，专为这块 SoC 写的
+          if [ "${{ inputs.npu_status }}" = "true" ]; then
+            git clone --depth 1 https://github.com/rchen14b/luci-app-airoha-npu.git \
+              package/luci-app-airoha-npu || echo "::warning::NPU 状态页拉取失败，跳过"
+          else
+            echo "跳过 NPU 状态页"
+          fi
+
+          # ---- aurora 主题 ----
+          # Vite + Tailwind 构建，要在 runner 上跑 npm，是第三方包里最容易挂的一环
+          if [ "${{ inputs.aurora_theme }}" = "true" ]; then
+            git clone --depth 1 https://github.com/eamonxg/luci-theme-aurora.git \
+              package/luci-theme-aurora || echo "::warning::主题拉取失败，跳过"
+          else
+            echo "跳过 aurora 主题"
+          fi
+
+          echo "=== package/ 下的第三方包 ==="
+          ls -d package/easytier package/luci-app-easytier \
+                package/luci-app-airoha-npu package/luci-theme-aurora 2>/dev/null || true
+
+      - name: 安装 feeds
+        run: |
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+      - name: 生成 .config
+        run: |
+          # 默认走 configs/myapps.config 里选好的那 4 台。
+          # 填了 profile 就切成单设备模式：把那 4 条 =y 全删掉再写指定的一台。
+          # （不能只是改一行，那样会留下重复的设备条目）
+          if [ -n "${{ inputs.profile }}" ]; then
+            echo "=== 单设备模式：${{ inputs.profile }} ==="
+            sed -i -E '/^CONFIG_TARGET_DEVICE_airoha_[a-z0-9]+_DEVICE_[A-Za-z0-9_-]+=y$/d' \
+              configs/myapps.config
+            echo "CONFIG_TARGET_DEVICE_airoha_${{ inputs.target }}_DEVICE_${{ inputs.profile }}=y" \
+              >> configs/myapps.config
+          else
+            echo "=== 多设备模式：编译 myapps.config 里选中的全部设备 ==="
+          fi
+
+          # kconfig.pl 的叠加顺序是「先官方后自定义」，后者覆盖前者，
+          # 所以 myapps.config 里的 "is not set" 能把官方的 =y 关掉。
+          ./scripts/kconfig.pl + \
+            "configs/${{ inputs.target }}.config" \
+            configs/myapps.config > .config
+
+          echo "CONFIG_CCACHE=y" >> .config
+          make defconfig
+
+          # 打印最终要编译的设备，一眼确认有没有选错
+          echo "=== 本次编译的设备 ==="
+          grep -oE '^CONFIG_TARGET_DEVICE_airoha_[a-z0-9]+_DEVICE_[A-Za-z0-9_-]+=y' .config \
+            | sed 's/CONFIG_TARGET_DEVICE_airoha_/  /;s/_DEVICE_/  \//;s/=y//'
+
+      # OpenWrt 遇到不存在的包是静默丢弃，不报错也不警告。
+      # PON 组件缺一样这个固件就是砖（刷完 pon0 接口都不存在），所以硬校验失败。
+      # 其余包缺了只是功能不全，飘黄提示即可，不打断编译。
+      - name: 校验 PON 核心组件是否编入固件
+        run: |
+          # 必须全部是 =y（进固件）。=m 只在 bin/packages 里出 apk，刷完得手动装，
+          # 对 frontend 驱动来说等于没有，pon0 接口根本起不来。
+          # en7572 和 paged-bosa 两个都要：烽火那 3 台吃 paged-bosa，Nokia MD 吃 en7572。
+          fatal=""
+          for pkg in \
+            airoha-pond airoha-ponctl airoha-pon-debug luci-app-pon \
+            kmod-airoha-xpon kmod-airoha-pon-frontend \
+            kmod-airoha-en7572 kmod-airoha-paged-bosa; do
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=y$" .config; then
+              echo "  [固件内置] $pkg"
+            else
+              echo "  [!!缺失!!] $pkg"
+              fatal="$fatal $pkg"
+            fi
+          done
+          if [ -n "$fatal" ]; then
+            echo "::error::PON 核心组件没进固件:$fatal"
+            echo "::error::多半是 feeds update/install 失败，或配置项被写成了 =m。"
+            echo "::error::现在中止，总比编 3 小时出来一块砖强。"
+            exit 1
+          fi
+          echo "PON 核心组件全部就绪"
+
+      - name: 校验其余自定义包
+        run: |
+          missing=""
+          for line in $(grep -E '^CONFIG_PACKAGE_.+=(y|m)$' configs/myapps.config); do
+            pkg="${line#CONFIG_PACKAGE_}"
+            pkg="${pkg%%=*}"
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=(y|m)$" .config; then
+              echo "  [已编入] $pkg"
+            else
+              echo "  [缺失]   $pkg"
+              missing="$missing $pkg"
+            fi
+          done
+          if [ -n "$missing" ]; then
+            echo "::warning::以下包没被编入，通常 feeds 里没有或包名写错:$missing"
+          fi
+
+      - name: 下载源码包
+        run: make download -j"$(nproc)"
+
+      - name: 编译工具链
+        # 先单独跑一遍工具链，这样能把 toolchain 缓存保存下来
+        # 后续即便 make world 失败，工具链也不会白做
+        run: make toolchain/install -j"$(nproc)"
+
+      - name: 保存交叉工具链缓存
+        if: steps.tc-cache.outputs.cache-hit != 'true'
+        run: |
+          tar --zstd -cf tc-cache.tar.zst staging_dir/toolchain staging_dir/host
+          ls -lh tc-cache.tar.zst
+
+      - name: 编译固件
+        run: |
+          if [ "${{ inputs.verbose }}" = "true" ]; then
+            make V=s -j"$(nproc)"
+          else
+            make -j"$(nproc)"
+          fi
+
+      - name: 查看 ccache 统计
+        if: always()
+        run: ccache -s || true
+
+      - name: 整理产物
+        run: |
+          mkdir -p out out/packages
+          # 固件本体：sysupgrade.itb 和 recovery.itb
+          find bin/targets/airoha/${{ inputs.target }} -name '*.itb' \
+            -exec cp {} out/ \; 2>/dev/null || true
+          # =m 的那些包会编成 apk 安装包，刷完机可以 apk add 按需装
+          find bin/packages -name '*.apk' \
+            -exec cp {} out/packages/ \; 2>/dev/null || true
+          cd out && sha256sum *.itb > sha256sums 2>/dev/null || true
+          echo "=== 固件 ===";     ls -lh *.itb
+          echo "=== 附加 apk ==="; ls packages | head -20
+
+      - name: 上传固件
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-${{ inputs.target }}-${{ inputs.profile || 'all' }}-${{ github.run_number }}
+          path: out
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: 发布 Release
+        if: inputs.create_release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ inputs.release_tag }}"
+          [ -z "$TAG" ] && TAG="$(date +%Y%m%d)-${{ github.run_number }}"
+          gh release create "$TAG" out/* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "PonWrt $TAG" --generate-notes
+
+      - name: 失败排查提示
+        if: failure()
+        run: |
+          echo "::error::编译失败。重新运行时勾选 verbose 选项可获得完整日志(V=s)"
+          echo "::error::如果是下载源码失败，通常是上游站点临时故障，直接重跑即可"
